@@ -1,274 +1,287 @@
-import warnings, os, re, json, pathlib, inspect
-warnings.filterwarnings("ignore")
-import pandas as pd, numpy as np
-import matplotlib.pyplot as plt, seaborn as sns
-sns.set(style="whitegrid")
-
-from sklearn import __version__ as sklearn_version
+import os, re, inspect, warnings
+import numpy as np
+import pandas as pd
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans, DBSCAN
-from sklearn.covariance import GraphicalLassoCV, GraphicalLasso, LedoitWolf
-from sklearn.linear_model import LassoCV
-import statsmodels.api as sm
-
-use_causallearn = False
-try:
-    from causallearn.search.ConstraintBased.PC import pc
-    from causallearn.utils.GraphUtils import GraphUtils
-    use_causallearn = True
-    print("causal-learn available: PC algorithm will be used.")
-except Exception as e:
-    print("causal-learn not available; fallback to GraphicalLasso. (this is OK)")
-
-import networkx as nx
-import plotly.graph_objects as go
-
-# supervised modelling
+from sklearn.covariance import GraphicalLassoCV
+from sklearn.model_selection import (train_test_split, KFold,
+                                     cross_val_score, GridSearchCV,
+                                     RepeatedKFold)        
+from sklearn.metrics import r2_score
+from sklearn.linear_model import Ridge, Lasso, ElasticNet, BayesianRidge, LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-import joblib
-import shap
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+import shap, joblib
 
-def make_onehot(handle_unknown='ignore'):
-    """
-    Create OneHotEncoder safely across sklearn versions.
-    Sets sparse_output=False or sparse=False if supported; otherwise creates encoder without those kwargs.
-    """
-    kwargs = {'handle_unknown': handle_unknown}
-    sig = inspect.signature(OneHotEncoder.__init__)
-    params = sig.parameters
-    if 'sparse_output' in params:
-        kwargs['sparse_output'] = False
-    elif 'sparse' in params:
-        kwargs['sparse'] = False
-    # else: do not pass sparsity kwarg
+def make_onehot(handle_unknown="ignore"):
+    kwargs = {"handle_unknown": handle_unknown}
+    sig = inspect.signature(OneHotEncoder.__init__).parameters
+    if "sparse_output" in sig:
+        kwargs["sparse_output"] = False
+    elif "sparse" in sig:
+        kwargs["sparse"] = False
     return OneHotEncoder(**kwargs)
 
-def get_onehot_feature_names(ohe, input_columns):
-    """Return feature names robustly across sklearn versions."""
-    if hasattr(ohe, "get_feature_names_out"):
-        return list(ohe.get_feature_names_out(input_columns))
-    elif hasattr(ohe, "get_feature_names"):
-        try:
-            return list(ohe.get_feature_names(input_columns))
-        except:
-            # older signature might not accept input_columns
-            return list(ohe.get_feature_names())
-    else:
-        # fallback: generate approximate names
-        names = []
-        for c in input_columns:
-            names.append(c)
-        return names
 
-def make_tsne(**kwargs):
-    """
-    Create TSNE with argument name that fits installed sklearn.
-    Accepts 'n_iter' in kwargs; will map to available parameter name (n_iter or max_iter).
-    """
-    sig = inspect.signature(TSNE.__init__)
-    params = sig.parameters
-    # prefer n_iter => map to max_iter if needed
-    if 'n_iter' in kwargs:
-        nval = kwargs.pop('n_iter')
-        if 'n_iter' in params:
-            kwargs['n_iter'] = nval
-        elif 'max_iter' in params:
-            kwargs['max_iter'] = nval
-    return TSNE(**kwargs)
-
-fn = "Other parameters.xlsx"
-assert os.path.exists(fn), f"File {fn} not found. Upload it to Colab."
-df = pd.read_excel(fn)
-print("Loaded dataframe shape:", df.shape)
-
-raw_targets = {
-    "morphology": ["grain size", "roughness"],
-    "electrical": [
-        "Carrier Lifetime", "Electron defect density", "Hole defect density",
-        "Trap-Filled Limit Voltage electron", "Trap Density electron",
-        "Trap-Filled Limit Voltage hole", "Trap Density  Hole",
-        "Electron Mobility", "Hole Mobility", "Conductivity"
-    ],
-    "optical": ["Photoluminescence Lifetime", "Absorption Edge", "Bandgap"]
-}
-
-def norm(s): return re.sub(r'[^a-z0-9]', '', str(s).lower())
-col_norm_map = {c: norm(c) for c in df.columns}
-
-def find_best_col(name):
+def fuzzy_match(name, columns):
+    def norm(s): return re.sub(r"[^a-z0-9]", "", str(s).lower())
     n = norm(name)
-    for c, ncol in col_norm_map.items():
-        if n == ncol: return c
-    for c, ncol in col_norm_map.items():
-        if n in ncol or ncol in n: return c
-    tokens = set(re.findall(r'[a-z0-9]+', name.lower()))
-    best, best_score = None, 0
-    for c in df.columns:
-        tokens2 = set(re.findall(r'[a-z0-9]+', c.lower()))
-        score = len(tokens & tokens2)
-        if score > best_score: best, best_score = c, score
-    return best if best_score > 0 else None
-
-targets = {}
-for group, names in raw_targets.items():
-    mapped = []
-    for nm in names:
-        col = find_best_col(nm)
-        if col: mapped.append(col)
-        else: print(f"Warning: no match for '{nm}'")
-    targets[group] = mapped
-    print(f"{group} targets mapped ({len(mapped)}): {mapped}")
-
-all_targets = sum(targets.values(), [])
-print("Total explicit targets:", len(all_targets))
-
-metadata_like = ['Ref_no','Ref No','Ref','Year','Structure','SUBSTRATE','Index']
-candidate_predictors = [c for c in df.columns if c not in all_targets and c not in metadata_like]
-print("Candidate predictors count:", len(candidate_predictors))
+    for col in columns:
+        if norm(col) == n: return col
+    for col in columns:
+        if n in norm(col) or norm(col) in n: return col
+    tokens = set(re.findall(r"[a-z0-9]+", name.lower()))
+    best, best_sc = None, 0
+    for col in columns:
+        sc = len(tokens & set(re.findall(r"[a-z0-9]+", col.lower())))
+        if sc > best_sc: best, best_sc = col, sc
+    return best if best_sc > 0 else None
 
 
+DATA_FILE = "file name"
+df_raw = pd.read_excel(DATA_FILE)
 
-df_predictors = df[candidate_predictors].copy()
-num_cols = df_predictors.select_dtypes(include=['number']).columns.tolist()
-cat_cols = [c for c in df_predictors.columns if c not in num_cols]
 
-num_pipeline = Pipeline([
-    ('imputer', IterativeImputer(random_state=0, max_iter=15)),
-    ('scaler', StandardScaler())
-])
+ALL_TARGETS_NOMINAL = [
+    "grain size", "roughness",
+    "Carrier Lifetime", "Electron defect density",
+    "Hole defect density", "Trap-Filled Limit Voltage electron",
+    "Trap Density electron", "Trap-Filled Limit Voltage hole",
+    "Trap Density  Hole", "Electron Mobility", "Hole Mobility", "Conductivity",
+    "Photoluminescence Lifetime", "Absorption Edge",
+]
 
-if cat_cols:
-    cat_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('onehot', make_onehot(handle_unknown='ignore'))
-    ])
-    pre = ColumnTransformer([('num', num_pipeline, num_cols), ('cat', cat_pipeline, cat_cols)])
-else:
-    pre = ColumnTransformer([('num', num_pipeline, num_cols)])
 
-X_pred = pre.fit_transform(df_predictors)
-proc_num_cols = num_cols.copy()
-proc_cat_cols = []
-if cat_cols:
-    try:
-        ohe = pre.named_transformers_['cat'].named_steps['onehot']
-        proc_cat_cols = get_onehot_feature_names(ohe, cat_cols)
-    except Exception as e:
-        # fallback: approximate
-        proc_cat_cols = [f"{c}_ohe" for c in cat_cols]
+EXTRA_NON_PREDICTOR_NAMES = ["Bandgap", "Urbach Energy"]
 
-proc_pred_cols = proc_num_cols + proc_cat_cols
-df_pred_processed = pd.DataFrame(X_pred, columns=proc_pred_cols)
-print("Processed predictors shape:", df_pred_processed.shape)
+MIN_SAMPLES   = 20
+METADATA_COLS = ["Ref_no", "Ref No", "Ref", "Year", "Structure", "SUBSTRATE", "Index"]
 
-df_targets_orig = df[all_targets].copy()
-imputer_for_targets = IterativeImputer(random_state=1, max_iter=15)
-targets_imputed = pd.DataFrame(imputer_for_targets.fit_transform(df_targets_orig),
-                               columns=df_targets_orig.columns)
+eligible_targets, excluded_targets, target_col_map = [], [], {}
 
-plt.figure(figsize=(16,10))
-sns.heatmap(targets_imputed.corr(), annot=True, cmap='coolwarm', center=0)
-plt.title("Correlation Between Target Variables")
-plt.show()
+for name in ALL_TARGETS_NOMINAL:
+    col = fuzzy_match(name, df_raw.columns)
+    if col is None: continue
+    n = int(df_raw[col].notna().sum())
+    target_col_map[name] = col
+    if n >= MIN_SAMPLES:
+        eligible_targets.append(col)
+    else:
+        excluded_targets.append(col)
 
-corr_all = pd.concat([df_pred_processed, targets_imputed], axis=1).corr()
-corr_pred_target = corr_all.loc[df_pred_processed.columns, targets_imputed.columns]
+all_target_cols = eligible_targets + excluded_targets
 
-top_n = 10  # choose how many top features per target
+extra_excl_cols = []
+for name in EXTRA_NON_PREDICTOR_NAMES:
+    col = fuzzy_match(name, df_raw.columns)
+    if col and col not in all_target_cols:
+        extra_excl_cols.append(col)
 
-for target in targets_imputed.columns:
-        top_feats = corr_pred_target[target].abs().sort_values(ascending=False).head(top_n).index
-    top_corrs = corr_pred_target.loc[top_feats, target]
 
-    plt.figure(figsize=(8,5))
-    sns.barplot(x=top_corrs.values, y=top_corrs.index, palette="viridis")
-    plt.title(f"Top {top_n} Correlated Features with {target}")
-    plt.xlabel("Correlation coefficient")
-    plt.ylabel("Feature")
-    plt.tight_layout()
-    plt.show()
+exclude_from_preds = set(all_target_cols) | set(extra_excl_cols) | set(METADATA_COLS)
+candidate_cols     = [c for c in df_raw.columns if c not in exclude_from_preds]
 
-df_for_clust = pd.concat([df_pred_processed, targets_imputed], axis=1)
-# 1)
-from sklearn.preprocessing import StandardScaler
+df_preds   = df_raw[candidate_cols].copy()
+num_cols_g = df_preds.select_dtypes(include=["number"]).columns.tolist()
+cat_cols_g = [c for c in df_preds.columns if c not in num_cols_g]
 
-X_scaled = StandardScaler().fit_transform(df_pred_processed)  # predictors only!
-pca_emb = PCA(n_components=2, random_state=0).fit_transform(X_scaled)
+parts = [("num", Pipeline([
+              ("imp", IterativeImputer(random_state=42, max_iter=10)),
+              ("sc",  StandardScaler()),
+          ]), num_cols_g)]
+if cat_cols_g:
+    parts.append(("cat", Pipeline([
+        ("imp", SimpleImputer(strategy="most_frequent")),
+        ("ohe", make_onehot()),
+    ]), cat_cols_g))
 
-plt.figure(figsize=(8,5))
-plt.scatter(pca_emb[:,0], pca_emb[:,1], s=50, c='skyblue')
-plt.title("PCA Projection (Scaled Features)")
-plt.xlabel("PC1")
-plt.ylabel("PC2")
-plt.show()
-for target in targets_imputed.columns:
-    plt.figure(figsize=(8,5))
-    plt.scatter(pca_emb[:,0], pca_emb[:,1],
-                c=targets_imputed[target], cmap='viridis', s=60)
-    plt.colorbar(label=target)
-    plt.title(f"PCA Projection colored by {target}")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.show()
+global_pre   = ColumnTransformer(parts)
+X_global     = global_pre.fit_transform(df_preds)
 
-pca = PCA().fit(X_scaled)
-plt.plot(np.cumsum(pca.explained_variance_ratio_)*100)
-plt.xlabel("Number of Components")
-plt.ylabel("Explained Variance (%)")
-plt.title("PCA Variance Explained")
-plt.grid(True)
-plt.show()
+try:
+    feat_names = [n.split("__", 1)[-1] for n in global_pre.get_feature_names_out()]
+except Exception:
+    feat_names = [f"f{i}" for i in range(X_global.shape[1])]
 
-from mpl_toolkits.mplot3d import Axes3D
+df_pred_proc = pd.DataFrame(X_global, columns=feat_names)
+X_scaled     = X_global
 
-pca_emb3d = PCA(n_components=3, random_state=0).fit_transform(X_scaled)
-fig = plt.figure(figsize=(8,6))
-ax = fig.add_subplot(111, projection='3d')
-sc = ax.scatter(pca_emb3d[:,0], pca_emb3d[:,1], pca_emb3d[:,2],
-                c='skyblue', s=50)
-ax.set_title("3D PCA Projection")
-plt.show()
 
-X = df_pred_processed.values  # predictors only
-from sklearn.preprocessing import StandardScaler
-X_scaled = StandardScaler().fit_transform(X)
 
-# t-SNE (use helper to map n_iter <-> max_iter)
-from sklearn.manifold import TSNE
-
-for perp in [5, 15, 30, 50]:
-    tsne_emb = TSNE(n_components=2, perplexity=perp, learning_rate='auto',
-                    n_iter=2000, random_state=0).fit_transform(X_scaled)
-    plt.figure(figsize=(8,5))
-    plt.scatter(tsne_emb[:,0], tsne_emb[:,1], s=50, alpha=0.7)
-    plt.title(f"t-SNE Projection (perplexity={perp})")
-    plt.show()
-
-kmeans = KMeans(n_clusters=3, random_state=0, n_init=10)
+kmeans        = KMeans(n_clusters=3, n_init=10, random_state=42)
 kmeans_labels = kmeans.fit_predict(X_scaled)
 
-plt.figure(figsize=(8,5))
-plt.scatter(pca_emb[:,0], pca_emb[:,1], c=kmeans_labels, cmap='tab10', s=50)
-plt.title("KMeans Clusters (PCA view, scaled)")
-plt.show()
+DBSCAN_FINAL_EPS = 1.0
+db_labels_dict   = {}
+for eps_val in [0.3, 0.5, 1.0]:
+    db_run = DBSCAN(eps=eps_val, min_samples=5).fit(X_scaled)
+    db_labels_dict[eps_val] = db_run.labels_
 
-for eps in [0.3, 0.5, 1.0]:
-    db = DBSCAN(eps=eps, min_samples=5).fit(X_scaled)
-    plt.figure(figsize=(8,5))
-    plt.scatter(tsne_emb[:,0], tsne_emb[:,1], c=db.labels_, cmap='tab10', s=50)
-    plt.title(f"DBSCAN Clusters (t-SNE view, eps={eps})")
-    plt.show()
+dbscan_labels = db_labels_dict[DBSCAN_FINAL_EPS]
 
-df_clusters = df.copy()
-df_clusters['KMeans_cluster'] = kmeans_labels
-df_clusters['DBSCAN_cluster'] = db.labels_
-df_clusters.to_excel("Selected_clusters.xlsx", index=False)
-print("Clusters saved to Selected_clusters.xlsx")
+
+target_obs_df = df_raw[all_target_cols].copy()
+corr_targets  = target_obs_df.corr(method="pearson")  # pairwise complete obs.
+
+TOP_N        = 10
+corr_rows    = []
+
+for t_col in all_target_cols:
+    obs   = df_raw[t_col].notna().values
+    n_obs = obs.sum()
+    if n_obs < 5:
+        continue
+    y_obs_t = df_raw.loc[obs, t_col].values
+    X_obs   = df_pred_proc[obs]
+    r       = X_obs.apply(lambda c: np.corrcoef(c.values, y_obs_t)[0, 1])
+    top     = r.abs().sort_values(ascending=False).head(TOP_N).index
+    for rank, feat in enumerate(top, 1):
+        corr_rows.append({"Target"   : t_col,
+                           "Rank"     : rank,
+                           "Feature"  : feat,
+                           "Pearson_r": round(float(r[feat]), 6)})
+
+
+imp_causal = IterativeImputer(random_state=42, max_iter=10)
+T_imputed  = pd.DataFrame(
+    imp_causal.fit_transform(target_obs_df),
+    columns=target_obs_df.columns,
+)
+T_scaled     = StandardScaler().fit_transform(T_imputed)
+causal_edges = []
+
+try:
+    gl   = GraphicalLassoCV(cv=3, max_iter=500).fit(T_scaled)
+    prec = gl.precision_.copy()
+    np.fill_diagonal(prec, 0)
+
+    nonzero   = np.abs(prec[np.abs(prec) > 1e-9])
+    threshold = float(np.percentile(nonzero, 70)) if len(nonzero) > 0 else 1e-6
+    adj       = (np.abs(prec) > threshold).astype(int)
+
+    col_list = T_imputed.columns.tolist()
+    corr_mat = corr_targets.values
+    for i in range(adj.shape[0]):
+        for j in range(i + 1, adj.shape[0]):
+            if adj[i, j]:
+                si   = np.sum(np.abs(corr_mat[i, :]))
+                sj   = np.sum(np.abs(corr_mat[j, :]))
+                edge = (col_list[i], col_list[j]) if si >= sj \
+                    else (col_list[j], col_list[i])
+                causal_edges.append(edge)
+
+    
+except Exception:
+    pass
+
+TARGET   = fuzzy_match("Trap Density electron", df_raw.columns)
+obs_mask = df_raw[TARGET].notna().values
+n_obs    = int(obs_mask.sum())
+
+X_raw = df_preds[obs_mask].copy().reset_index(drop=True)
+y_obs = df_raw.loc[obs_mask, TARGET].values
+
+X_raw["KMeans_cluster"] = kmeans_labels[obs_mask].astype(float)
+X_raw["DBSCAN_cluster"]  = dbscan_labels[obs_mask].astype(float)
+
+num_cols_s = X_raw.select_dtypes(include=["number"]).columns.tolist()
+cat_cols_s = [c for c in X_raw.columns if c not in num_cols_s]
+
+sup_parts = [("num", Pipeline([
+                  ("imp", IterativeImputer(random_state=42, max_iter=10)),
+                  ("sc",  StandardScaler()),
+              ]), num_cols_s)]
+if cat_cols_s:
+    sup_parts.append(("cat", Pipeline([
+        ("imp", SimpleImputer(strategy="most_frequent")),
+        ("ohe", make_onehot()),
+    ]), cat_cols_s))
+
+sup_pre = ColumnTransformer(sup_parts)
+KF      = KFold(n_splits=5, shuffle=True, random_state=42)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_raw, y_obs, test_size=0.20, random_state=42,
+)
+
+BENCHMARK_MODELS = {
+    "Random Forest"          : RandomForestRegressor(random_state=42),
+    "Hist Gradient Boosting" : HistGradientBoostingRegressor(random_state=42),
+    "KNN"                    : KNeighborsRegressor(),
+    "Elastic Net"            : ElasticNet(),
+    "Decision Tree"          : DecisionTreeRegressor(random_state=42),
+    "Bayesian Ridge"         : BayesianRidge(),
+    "SVR linear"             : SVR(kernel="linear"),
+    "MLP small"              : MLPRegressor(hidden_layer_sizes=(50,),
+                                            max_iter=2000, random_state=42),
+    "Ridge"                  : Ridge(),
+    "Lasso"                  : Lasso(),
+    "Linear Regression"      : LinearRegression(),
+}
+
+bench_rows = []
+for mname, estimator in BENCHMARK_MODELS.items():
+    pipe = Pipeline([("pre", sup_pre), ("model", estimator)])
+    pipe.fit(X_train, y_train)
+    tr = float(r2_score(y_train, pipe.predict(X_train)))
+    te = float(r2_score(y_test,  pipe.predict(X_test)))
+    cv = float(np.mean(cross_val_score(pipe, X_raw, y_obs, cv=KF, scoring="r2")))
+    bench_rows.append({"Model"   : mname,
+                        "Train R2": round(tr, 6),
+                        "Test R2" : round(te, 6),
+                        "CV R2"   : round(cv, 6)})
+
+rf_gs_pipe = Pipeline([
+    ("pre",   sup_pre),
+    ("model", RandomForestRegressor(random_state=42, n_jobs=-1)),
+])
+PARAM_GRID = {
+    "model__n_estimators"    : [100, 200, 500],
+    "model__max_depth"       : [6, 12, None],
+    "model__min_samples_leaf": [1, 3],
+}
+gs = GridSearchCV(rf_gs_pipe, PARAM_GRID, cv=KF,
+                  scoring="r2", n_jobs=-1, refit=True)
+gs.fit(X_train, y_train)
+best_pipe = gs.best_estimator_
+
+rkf = RepeatedKFold(n_splits=20, n_repeats=1000, random_state=42)
+cross_val_score(
+    Pipeline([
+        ("pre",   sup_pre),
+        ("model", RandomForestRegressor(
+                      n_estimators     = gs.best_params_["model__n_estimators"],
+                      max_depth        = gs.best_params_["model__max_depth"],
+                      min_samples_leaf = gs.best_params_["model__min_samples_leaf"],
+                      n_jobs           = 1,
+                      random_state     = 42)),
+    ]),
+    X_raw, y_obs,
+    cv      = rkf,
+    scoring = "r2",
+    n_jobs  = 1,
+)
+
+
+rf_fit    = best_pipe.named_steps["model"]
+pre_fit   = best_pipe.named_steps["pre"]
+X_te_proc = pre_fit.transform(X_test)
+n_out     = X_te_proc.shape[1]
+
+try:
+    all_feat_names = [s.split("__", 1)[-1] for s in pre_fit.get_feature_names_out()]
+except Exception:
+    all_feat_names = [f"f{i}" for i in range(n_out)]
+if len(all_feat_names) != n_out:
+    all_feat_names = [f"f{i}" for i in range(n_out)]
+
+X_te_df   = pd.DataFrame(X_te_proc, columns=all_feat_names)
+shap_vals = shap.TreeExplainer(rf_fit).shap_values(X_te_df)
+
